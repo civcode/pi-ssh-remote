@@ -17,6 +17,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 ### Fixed
 
 - Added Pi argument completion for `/remote` subcommands, saved endpoints, config keys, and exec flags, including preserving already-entered `/remote exec` options while completing later flags.
+- Stopped suggesting already-complete `/remote` arguments so Enter submits the command instead of accepting a redundant completion, including when the cursor is immediately after `ssh` before the connection arguments.
 
 ## [0.1.13] - 2026-09-18
 

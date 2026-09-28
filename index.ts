@@ -441,6 +441,9 @@ const REMOTE_EXEC_COMPLETIONS: AutocompleteItem[] = [
 
 function filterAutocompleteItems(items: AutocompleteItem[], prefix: string): AutocompleteItem[] | null {
   const needle = prefix.toLowerCase();
+  // Pi consumes Enter while an argument completion is active. A complete token
+  // must submit as-is, even if it is also a prefix of another saved endpoint.
+  if (items.some((item) => item.value.toLowerCase() === needle)) return null;
   const matches = items.filter((item) => item.value.toLowerCase().startsWith(needle));
   return matches.length ? matches : null;
 }
