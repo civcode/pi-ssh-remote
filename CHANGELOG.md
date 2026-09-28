@@ -12,7 +12,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Changed
 
-- None.
+- Removed automatic trailing spaces from `/remote` subcommand completions, leaving users to type the separator before entering the next argument.
+- Updated both README command examples and tables to use the canonical `/remote disconnect` command.
 
 ### Fixed
 
