@@ -16,6 +16,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   getAgentDir,
+  SettingsManager,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
   createBashTool,
@@ -128,6 +129,8 @@ const MAX_REMOTE_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
 const MAX_PRIVATE_KEY_BYTES = 1024 * 1024;
 const SESSION_STATE_ENTRY_TYPE = "pi-ssh-remote-state";
 const CACHE_KEY = "__piHpcCredentialCacheV1";
+const REMOTE_FILE_TOOL_ROUTING_DESCRIPTION = "With SSH routing active, this tool operates directly on the remote workspace.";
+const REMOTE_SHELL_TOOL_ROUTING_DESCRIPTION = "With SSH routing active, this tool runs directly in the remote workspace.";
 const cacheHost = globalThis as typeof globalThis & { [CACHE_KEY]?: CredentialCache };
 const credentialCache = cacheHost[CACHE_KEY] ??= { passwords: new Map<string, string>(), keyPassphrases: new Map<string, string>() };
 credentialCache.keyPassphrases ??= new Map<string, string>();
@@ -608,12 +611,8 @@ function memoryManagementPrompt(remote: RemoteState): string {
   return `Persistent memory for this SSH server is a local JSON file at ${path}. This exact path is always handled by Pi's local read, write, and edit tools even while other tools are routed over SSH. The file schema is {"server":"${serverMemoryId(remote)}","entries":[{"id":"stable-unique-id","content":"memory text"}]}. If the file does not exist, create it with that server value and an empty entries array. Read the file before changing it and preserve valid JSON plus all unrelated entries. Add by appending one object with a unique stable id; query by reading the file; update by editing only the matching id. DELETE SAFETY: delete an entry only when the user explicitly asks to delete, remove, or forget server memory. Before deleting, read the file and identify the exact id; if the target is ambiguous, ask the user. Use edit to remove only that exact object and preserve every other entry. Never treat a correction or replacement request as permission to delete, and never delete all entries unless the user explicitly requests deletion of all server memory.`;
 }
 
-function remoteSystemPrompt(systemPrompt: string, localCwd: string, remote: RemoteState): string {
-  const workspacePrompt = systemPrompt.replace(
-    `Current working directory: ${localCwd}`,
-    `Current working directory: ${remote.cwd} (via SSH ${endpointDisplayLabel(remote)}). All read, write, edit, bash, and user shell operations run on this remote server, except for the explicitly identified local server-memory JSON file. Use remote with action disconnect to return to the local environment when requested.`,
-  );
-  return `${workspacePrompt}\n\n${memoryManagementPrompt(remote)}`;
+function remoteWorkspacePrompt(remote: RemoteState): string {
+  return `SSH workspace: ${endpointDisplayLabel(remote)}:${remote.cwd}. The standard read, write, edit, and bash tools and user shell commands operate directly in this workspace.`;
 }
 
 function serverMemoryContext(remote: RemoteState): string | undefined {
@@ -754,6 +753,34 @@ class RemoteExecAccumulator {
 
 function previewRemoteOutput(output: string, displayLines: number): string {
   return truncateTail(output, { maxLines: displayLines, maxBytes: DEFAULT_MAX_BYTES }).content || "Remote command completed.";
+}
+
+function renderRemoteControlCall(params: any, theme: any): Component {
+  const args = params ?? {};
+  const action = typeof args.action === "string" && args.action ? args.action : "...";
+  const stringArg = (value: unknown): string | undefined => typeof value === "string" ? value : undefined;
+  let operand: string | undefined;
+
+  if (action === "exec") {
+    operand = `$ ${stringArg(args.remoteCommand) || "..."}`;
+  } else if (action === "connect") {
+    operand = stringArg(args.command);
+  } else if (action === "forward") {
+    const forwards = stringArg(args.forwards);
+    if (forwards !== undefined) operand = forwards || "...";
+  } else if (action === "chdir") {
+    operand = stringArg(args.cwd) || "...";
+  } else if (action === "note") {
+    const note = stringArg(args.note);
+    operand = note === undefined || note.trim() === "" ? "clear note" : note.trim();
+  } else if (action === "memory") {
+    operand = stringArg(args.command);
+  }
+
+  const title = theme.fg("toolTitle", theme.bold("remote"));
+  const actionText = theme.fg("muted", ` ${action}`);
+  const operandText = operand ? theme.fg("accent", `  ${operand}`) : "";
+  return new Text(`${title}${actionText}${operandText}`, 0, 0);
 }
 
 function renderRemoteControlResult(result: any, expanded: boolean, theme: any): Component {
@@ -1472,24 +1499,36 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   const localRead = createReadTool(localCwd);
   const localWrite = createWriteTool(localCwd);
   const localEdit = createEditTool(localCwd);
-  const localBash = createBashTool(localCwd);
+  let localBash = createBashTool(localCwd);
   const targetsLocalServerMemory = (path: unknown): boolean => {
     if (!remote || typeof path !== "string") return false;
     return resolve(path.replace(/^@/, "")) === serverMemoryFilePath(remote);
   };
   pi.registerTool({
     ...localRead,
-    description: `Read file contents. Remote text reads fetch only the requested range and return at most ${DEFAULT_READ_MAX_LINES} lines or ${formatSize(DEFAULT_READ_MAX_BYTES)} by default; use offset/limit to continue.`,
+    description: `Read file contents. Remote text reads fetch only the requested range and return at most ${DEFAULT_READ_MAX_LINES} lines or ${formatSize(DEFAULT_READ_MAX_BYTES)} by default; use offset/limit to continue. ${REMOTE_FILE_TOOL_ROUTING_DESCRIPTION}`,
     promptGuidelines: ["Use read with offset/limit for remote code and logs; inspect large files in focused chunks instead of reading them wholesale."],
     execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
       ? executeRemoteRead(id, params, signal, update)
       : localRead.execute(id, params, signal, update),
   });
-  pi.registerTool({ ...localWrite, execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path) ? createWriteTool(localCwd, { operations: remoteWriteOps() }).execute(id, params, signal, update) : localWrite.execute(id, params, signal, update) });
-  pi.registerTool({ ...localEdit, execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path) ? createEditTool(localCwd, { operations: remoteEditOps() }).execute(id, params, signal, update) : localEdit.execute(id, params, signal, update) });
+  pi.registerTool({
+    ...localWrite,
+    description: `${localWrite.description} ${REMOTE_FILE_TOOL_ROUTING_DESCRIPTION}`,
+    execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
+      ? createWriteTool(localCwd, { operations: remoteWriteOps() }).execute(id, params, signal, update)
+      : localWrite.execute(id, params, signal, update),
+  });
+  pi.registerTool({
+    ...localEdit,
+    description: `${localEdit.description} ${REMOTE_FILE_TOOL_ROUTING_DESCRIPTION}`,
+    execute: (id, params, signal, update) => remote && routeRemoteTools && !targetsLocalServerMemory(params.path)
+      ? createEditTool(localCwd, { operations: remoteEditOps() }).execute(id, params, signal, update)
+      : localEdit.execute(id, params, signal, update),
+  });
   pi.registerTool({
     ...localBash,
-    description: `Execute a shell command. Remote model-facing output returns at most the last ${DEFAULT_EXEC_MAX_LINES} lines or ${formatSize(DEFAULT_EXEC_MAX_BYTES)} by default; complete oversized output is saved locally.`,
+    description: `Execute a shell command. Remote model-facing output returns at most the last ${DEFAULT_EXEC_MAX_LINES} lines or ${formatSize(DEFAULT_EXEC_MAX_BYTES)} by default; complete oversized output is saved locally. ${REMOTE_SHELL_TOOL_ROUTING_DESCRIPTION}`,
     promptGuidelines: ["When using bash for remote logs and broad searches, use bounded commands such as tail, sed, or rg with limits instead of cat or unbounded find output."],
     execute: async (id, params, signal, update) => {
       if (!remote || !routeRemoteTools) return localBash.execute(id, params, signal, update);
@@ -1626,6 +1665,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       const state = await connectInteractive(command, ctx, params.cwd ?? configuredCwd(command));
       if (!state) throw new Error(lastConnectionError || "SSH remote connection was cancelled or failed");
       return { content: [{ type: "text", text: `Connected: ${endpointDisplayLabel(state)}:${state.cwd}` }], details: { connected: true, cwd: state.cwd } };
+    },
+    renderCall(params, theme) {
+      return renderRemoteControlCall(params, theme);
     },
     renderResult(result, { expanded }, theme) {
       return renderRemoteControlResult(result, expanded, theme);
@@ -1854,6 +1896,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   pi.on("turn_start", () => { turnOutputBytes = 0; });
   pi.on("session_start", async (event, ctx) => {
+    const settings = SettingsManager.create(ctx.cwd, getAgentDir(), {
+      projectTrusted: ctx.isProjectTrusted(),
+    });
+    localBash = createBashTool(ctx.cwd, {
+      shellPath: settings.getShellPath(),
+      commandPrefix: settings.getShellCommandPrefix(),
+    });
     currentCtx = ctx;
     sessionReady = true;
     status(ctx);
@@ -1911,9 +1960,12 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return { result: { output: (error as Error).message, exitCode: 1, cancelled: false, truncated: false } };
     }
   });
-  pi.on("before_agent_start", (event) => remote && routeRemoteTools ? {
-    systemPrompt: remoteSystemPrompt(event.systemPrompt, localCwd, remote),
-  } : undefined);
+  pi.on("before_agent_start", (event) => {
+    if (!remote || !routeRemoteTools) return;
+    event.systemPromptOptions.cwd = remote.cwd;
+    event.systemPromptOptions.sections.ssh_remote_workspace = remoteWorkspacePrompt(remote);
+    event.systemPromptOptions.sections.ssh_remote_memory_management = memoryManagementPrompt(remote);
+  });
   pi.on("context", (event) => {
     if (!remote || !routeRemoteTools) return undefined;
     const content = serverMemoryContext(remote);
